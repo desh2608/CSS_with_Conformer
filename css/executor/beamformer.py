@@ -1,5 +1,5 @@
-from lhotse.recipes.libricss import prepare_libricss
 import torch
+import math
 
 from asteroid.dsp.beamforming import compute_scm
 
@@ -18,13 +18,14 @@ class Beamformer:
         self.n_fft = beamforming_config["n_fft"]
         self.hop_length = beamforming_config["hop_size"]
 
-        self.eval_win = beamforming_config["eval_win"]
-        self.eval_hop = beamforming_config["eval_hop"]
-        self.proceed_margin = beamforming_config["proceed_margin"]
+        self.eval_win = int(beamforming_config["eval_win"] * sr)
+        self.eval_hop = int(beamforming_config["eval_hop"] * sr)
+        self.proceed_margin = beamforming_config["proceed_margin"] * sr
 
+        self.batch_size = beamforming_config["batch_size"]
         self.sr = sr
-        self.mask_hop = int(self.eval_hop * self.sr / self.hop_length)
-        self.mask_win = int(self.eval_win * self.sr / self.hop_length)
+        self.mask_hop = int(self.eval_hop / self.hop_length)
+        self.mask_win = int(self.eval_win / self.hop_length)
 
         self.rescale = rescale
 
@@ -38,54 +39,45 @@ class Beamformer:
         D, T = X.shape
         mask_ch0, mask_ch1, noise_mask = masks
 
-        nwin = int(T // int(self.eval_hop * self.sr))
+        X = X.squeeze(dim=0).unfold(0, self.eval_win + 256, self.eval_hop)  # B x T
+        mask_ch0 = mask_ch0.unfold(1, self.mask_win, self.mask_hop).permute(1, 0, 2)
+        mask_ch1 = mask_ch1.unfold(1, self.mask_win, self.mask_hop).permute(1, 0, 2)
+        noise_mask = noise_mask.unfold(1, self.mask_win, self.mask_hop).permute(1, 0, 2)
 
-        result_ch0 = torch.zeros((T,))
-        result_ch1 = torch.zeros((T,))
+        n_batches = math.ceil(X.shape[0] / self.batch_size)
 
-        for i in range(nwin):
+        result_ch0 = torch.zeros(T)
+        result_ch1 = torch.zeros(T)
 
-            st = int(self.eval_hop * self.sr * i)
-            en = st + int(self.eval_win * self.sr) + 256
+        for i in range(n_batches):
 
-            if en > T:
-                en = T
+            batch_start = i * self.batch_size
+            batch_end = min((i + 1) * self.batch_size, X.shape[0]) + 1
 
-            mask_st = self.mask_hop * i
-            mask_en = mask_st + self.mask_win
+            X_batch = X[batch_start:batch_end]
+            mask_ch0_batch = mask_ch0[batch_start:batch_end]
+            mask_ch1_batch = mask_ch1[batch_start:batch_end]
+            noise_mask_batch = noise_mask[batch_start:batch_end]
 
-            if mask_en > mask_ch0.shape[1]:
-                mask_en = mask_ch0.shape[1]
-
-            this_wav = X[:, st:en]
-            this_mask_ch0 = mask_ch0[:, mask_st:mask_en]
-            this_mask_ch1 = mask_ch1[:, mask_st:mask_en]
-            this_noise_mask = noise_mask[:, mask_st:mask_en]
-
-            out_ch0 = self.process_one_wav(
-                this_wav,
-                this_mask_ch0,
-                this_noise_mask,
-            )
-            out_ch1 = self.process_one_wav(
-                this_wav,
-                this_mask_ch1,
-                this_noise_mask,
-            )
+            out_ch0 = self.process_one_batch(X_batch, mask_ch0_batch, noise_mask_batch)
+            out_ch1 = self.process_one_batch(X_batch, mask_ch1_batch, noise_mask_batch)
 
             # deduplication by masking - give up recovering low-volume competitor
-            S = torch.stack((out_ch0, out_ch1), dim=0)  # 2 x F x T
-            S_pow = 10 * torch.log10(torch.sum(torch.abs(S) ** 2, dim=(1, 2)))
-            if S_pow[0] - S_pow[1] > 15:
-                S_abs = torch.abs(S)
-                gain = torch.divide(S_abs, torch.amax(S_abs, dim=0, keepdim=True))
-                S[1] = torch.multiply(torch.clamp(gain[1], min=10 ** (-40 / 20)), S[1])
-            elif S_pow[1] - S_pow[0] > 15:
-                S_abs = torch.abs(S)
-                gain = torch.divide(S_abs, torch.amax(S_abs, dim=0, keepdim=True))
-                S[0] = torch.multiply(torch.clamp(gain[0], min=10 ** (-40 / 20)), S[0])
+            S = torch.stack((out_ch0, out_ch1), dim=1)  # B x 2 x F x T
+            S_pow = 10 * torch.log10(torch.sum(torch.abs(S) ** 2, dim=(2, 3)))
+            S_abs = torch.abs(S)
+            gain = torch.divide(S_abs, torch.amax(S_abs, dim=1, keepdim=True))
+            for b in range(S.shape[0]):  # Apply deduplication to each chunk in batch
+                if S_pow[b, 0] - S_pow[b, 1] > 15:
+                    S[b, 1] = torch.multiply(
+                        torch.clamp(gain[b, 1], min=10 ** (-40 / 20)), S[b, 1]
+                    )
+                elif S_pow[b, 1] - S_pow[b, 0] > 15:
+                    S[b, 0] = torch.multiply(
+                        torch.clamp(gain[b, 0], min=10 ** (-40 / 20)), S[b, 0]
+                    )
 
-            out_ch0, out_ch1 = S[0], S[1]
+            out_ch0, out_ch1 = S[:, 0, ...], S[:, 1, ...]
             wav1 = torch.istft(
                 out_ch0,
                 n_fft=self.n_fft,
@@ -95,7 +87,7 @@ class Beamformer:
                 window=torch.hann_window(self.n_fft),
                 return_complex=False,
             )
-            wav1 = wav1[: this_wav.shape[-1]]
+            wav1 = wav1[:, : X_batch.shape[-1]]
             wav2 = torch.istft(
                 out_ch1,
                 n_fft=self.n_fft,
@@ -105,58 +97,38 @@ class Beamformer:
                 window=torch.hann_window(self.n_fft),
                 return_complex=False,
             )
-            wav2 = wav2[: this_wav.shape[-1]]
+            wav2 = wav2[:, : X_batch.shape[-1]]
 
-            if st == 0:
-                result_ch0[st : st + self.proceed_margin * self.sr] += wav1[
-                    : self.proceed_margin * self.sr
-                ]
-                result_ch1[st : st + self.proceed_margin * self.sr] += wav2[
-                    : self.proceed_margin * self.sr
-                ]
-            elif en == T:
-                result_ch0[
-                    st
-                    + self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : st
-                    + wav1.shape[0]
-                ] += wav1[
-                    self.proceed_margin * self.sr - int(self.eval_hop * self.sr) :
-                ]
-                result_ch1[
-                    st
-                    + self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : st
-                    + wav2.shape[0]
-                ] += wav2[
-                    self.proceed_margin * self.sr - int(self.eval_hop * self.sr) :
-                ]
-            else:
-                result_ch0[
-                    st
-                    + self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : st
-                    + self.proceed_margin * self.sr
-                ] += wav1[
-                    self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : self.proceed_margin * self.sr
-                ]
-                result_ch1[
-                    st
-                    + self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : st
-                    + self.proceed_margin * self.sr
-                ] += wav2[
-                    self.proceed_margin * self.sr
-                    - int(self.eval_hop * self.sr) : self.proceed_margin * self.sr
-                ]
+            st = self.eval_hop * batch_start
+            en = self.eval_hop * batch_end
+            # fmt: off
+            for b in range(len(wav1)):
+                if st == 0:
+                    result_ch0[st : st + self.proceed_margin] += wav1[b, : self.proceed_margin]
+                    result_ch1[st : st + self.proceed_margin] += wav2[b, : self.proceed_margin]
+                elif en == T:
+                    result_ch0[st + self.proceed_margin - self.eval_hop : st + wav1.shape[1]] += wav1[b, self.proceed_margin - self.eval_hop :]
+                    result_ch1[st + self.proceed_margin - self.eval_hop : st + wav2.shape[1]] += wav2[b, self.proceed_margin - self.eval_hop :]
+                else:
+                    result_ch0[st + self.proceed_margin - self.eval_hop : st + self.proceed_margin] += wav1[b, self.proceed_margin - self.eval_hop : self.proceed_margin]
+                    result_ch1[st + self.proceed_margin - self.eval_hop : st + self.proceed_margin] += wav2[b, self.proceed_margin - self.eval_hop : self.proceed_margin]
+                st += self.eval_hop
+                en += self.eval_hop
+            # fmt: on
 
+        # Normalize scale
         result_ch0 = result_ch0 * 0.9 / torch.max(torch.abs(result_ch0))
         result_ch1 = result_ch1 * 0.9 / torch.max(torch.abs(result_ch1))
         return result_ch0.unsqueeze(dim=0), result_ch1.unsqueeze(dim=0)
 
-    def process_one_wav(self, x, speech_mask, noise_mask):
-
+    def process_one_batch(self, x, speech_mask, noise_mask):
+        """
+        Process one batch of wav chunks.
+        x: B x N
+        speech_mask: B x F X T
+        noise_mask: B x F x T
+        Returns: beamformed wav chunks (B x F x T)
+        """
         S = torch.stft(
             x,
             n_fft=self.n_fft,
@@ -166,12 +138,12 @@ class Beamformer:
             window=torch.hann_window(self.n_fft),
             return_complex=True,
         ).unsqueeze(
-            0
-        )  # 1 x D x F x T
+            1
+        )  # B x D x F x T
         L = min([S.shape[-1], speech_mask.shape[-1]])
 
-        target_scm = compute_scm(S[..., :L], speech_mask[..., :L].unsqueeze(0))
-        distortion_scm = compute_scm(S[..., :L], noise_mask[..., :L].unsqueeze(0))
+        target_scm = compute_scm(S[..., :L], speech_mask[..., :L].unsqueeze(1))
+        distortion_scm = compute_scm(S[..., :L], noise_mask[..., :L].unsqueeze(1))
 
         result = (
             self.bf_module()
@@ -182,13 +154,24 @@ class Beamformer:
         if self.rescale:
             result = self.normalize_scale(result, S[..., :L], speech_mask[..., :L])
 
-        return result.squeeze(dim=0)  # F x T
+        return result  # B x F x T
 
     def normalize_scale(self, result_spec, ch0_spec, mask):
-        masked = mask * ch0_spec
+        """
+        Normalize scale of the result.
+        result_spec: B x F x T
+        ch0_spec: B x D x F x T
+        mask: B x F x T
+        """
+        ch0_spec = ch0_spec.squeeze(dim=1)  # B x F x T
+        masked = mask * ch0_spec  # B x F x T
 
-        masked_energy = torch.sqrt(torch.mean(torch.abs(masked) ** 2))
-        mvdr_energy = torch.sqrt(torch.mean(torch.abs(result_spec) ** 2))
+        masked_energy = torch.sqrt(
+            torch.mean(torch.abs(masked) ** 2, dim=(1, 2), keepdim=True)
+        )
+        mvdr_energy = torch.sqrt(
+            torch.mean(torch.abs(result_spec) ** 2, dim=(1, 2), keepdim=True)
+        )
 
         result_spec = result_spec / mvdr_energy * masked_energy
 

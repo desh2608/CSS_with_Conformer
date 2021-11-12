@@ -2,37 +2,53 @@ import numpy as np
 import torch
 import math
 
-from css.utils.model_util import get_model, to_numpy
+from css.utils.model_util import get_onnx_model, to_numpy
 from css.executor.feature import FeatureExtractor
 
 
 class Separator:
-    def __init__(self, separation_config, sr=16000, sess_options=None, device="cpu"):
+    def __init__(
+        self,
+        separation_config,
+        sr=16000,
+        sess_options=None,
+        device="cpu",
+        backend="onnx",
+    ):
 
-        if separation_config["model_path"].endswith(".onnx"):
+        if backend == "onnx":
             assert (
                 separation_config["batch_size"] == 1
             ), "ONNX models only support batch size 1"
 
-        self.separator, device = get_model(
-            separation_config["model_path"], sess_options, device
-        )
+        if backend == "onnx":
+            self.separator, device = get_onnx_model(
+                separation_config["model_path"], sess_options, device
+            )
+        else:
+            raise NotImplementedError("Only ONNX is supported at the moment")
+
         self.batch_size = separation_config["batch_size"]
-        self.sr = sr
         self.device = device
+
+        # Config options for CSS windowing
         self.eval_win = int(separation_config["eval_win"] * sr)
         self.eval_hop = int(separation_config["eval_hop"] * sr)
-        self.frame_length = separation_config["frame_length"] / sr
-        self.frame_shift = separation_config["frame_shift"] / sr
-        self.n_fft = separation_config["n_fft"]
-        self.feature = FeatureExtractor()
+
+        # Config options for STFT features
+        self.sr = sr
+        self.frame_length = separation_config["frame_length"]
+        self.frame_shift = separation_config["frame_shift"]
+        self.feature = FeatureExtractor(
+            frame_len=self.frame_length, frame_hop=self.frame_shift
+        )
 
     def separate(self, s):
         """
         s: waveform (1 x T), where 1 is number of channels and T is number of samples
         """
         assert s.shape[0] == 1, "Separator expects mono input"
-        s = s.squeeze(dim=0).unfold(0, self.eval_win, self.eval_hop)  # B x T
+        s = s.squeeze(dim=0).unfold(0, self.eval_win + 256, self.eval_hop)  # B x T
 
         # Run separation in batches of segments
         masks = []

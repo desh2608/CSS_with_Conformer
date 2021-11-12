@@ -3,12 +3,13 @@ import torch
 import logging
 
 logging.basicConfig(
-    format='%(asctime)s %(levelname)-8s %(message)s',
+    format="%(asctime)s %(levelname)-8s %(message)s",
     level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S',
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-def get_model(onnx_model_path, sess_options, device):
+
+def get_onnx_model(onnx_model_path, sess_options, device):
     if device == torch.device("cuda") and onnxruntime.get_device() != "GPU":
         logging.warning("To use GPU, please install onnxruntime-gpu")
         device = torch.device("cpu")

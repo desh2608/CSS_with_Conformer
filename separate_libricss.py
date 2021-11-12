@@ -7,12 +7,12 @@ import logging
 import sys
 
 import torch
-import onnxruntime
+import torchaudio
 import numpy as np
 
 from pathlib import Path
 
-from css.utils.audio_util import EgsReader, write_wav
+from css.utils.audio_util import EgsReader
 from css.executor.separator import Separator
 from css.executor.stitcher import Stitcher
 from css.executor.beamformer import Beamformer
@@ -30,14 +30,20 @@ def run(args):
     # prepare LibriCSS data
     manifests = prepare_libricss(args.corpus_dir)
     # egs reader
-    egs_reader = EgsReader(manifests["recordings"])
+    recordings = manifests["recordings"]
+    if args.session is not None:
+        recordings = recordings.filter(lambda x: f"session{args.session}" in x.id)
+    egs_reader = EgsReader(recordings)
 
-    # Settings for onnxruntime.
-    opts = onnxruntime.SessionOptions()
-    opts.inter_op_num_threads = 1
-    opts.intra_op_num_threads = 1
-    opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-    opts.use_deterministic_compute = True
+    if args.backend == "onnx":
+        import onnxruntime
+
+        # Settings for onnxruntime.
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+        opts.use_deterministic_compute = True
 
     # Load the config
     exp_config = yaml.load(open(args.config), Loader=yaml.FullLoader)
@@ -49,14 +55,16 @@ def run(args):
 
     # Create class objects for separation, stitching, and beamforming
     separator = Separator(
-        exp_config["separation"], sess_options=opts, sr=sampling_rate, device=device
+        exp_config["separation"],
+        sess_options=opts,
+        sr=sampling_rate,
+        device=device,
+        backend=args.backend,
     )
     stitcher = Stitcher(exp_config["stitching"])
     beamformer = Beamformer(exp_config["beamforming"])
 
     for key, egs in egs_reader:
-        if key != "OV40_session1":
-            continue
         logging.info(f"Processing utterance {key}...")
         mixed = egs["mix"]  # (D x T)
 
@@ -72,8 +80,8 @@ def run(args):
         wav_ch0, wav_ch1 = beamformer.continuous_process(mixed, stitched_masks)
 
         # Write out the separated audio
-        write_wav(dump_dir / f"{key}_ch0.wav", wav_ch0)
-        write_wav(dump_dir / f"{key}_ch1.wav", wav_ch1)
+        torchaudio.save(dump_dir / f"{key}_ch0.wav", wav_ch0, sampling_rate)
+        torchaudio.save(dump_dir / f"{key}_ch1.wav", wav_ch1, sampling_rate)
 
     logging.info(f"Processed {len(egs_reader)} utterances")
 
@@ -102,10 +110,19 @@ if __name__ == "__main__":
         help="Directory to dump separated speakers",
     )
     parser.add_argument(
+        "--backend", type=str, default="onnx", help="Backend to use (onnx | pytorch)"
+    )
+    parser.add_argument(
         "--gpu",
         type=bool,
         default=True,
         help="Use GPU for separation",
+    )
+    parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="Specify subset of sessions to process (useful for multi-GPU processing)",
     )
     args = parser.parse_args()
     run(args)

@@ -12,6 +12,7 @@ export MODEL_NAME=1ch_conformer_base
       --config conf/config.yaml \
       --corpus-dir /export/c01/corpora6/LibriCSS \
       --dump-dir exp/libricss/out_$MODEL_NAME \
+      --backend onnx \
       --num_spks 2
 )
 
