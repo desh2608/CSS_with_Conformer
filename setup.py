@@ -18,6 +18,7 @@ setup(
         "torch==1.8.0",
         "torchaudio>=0.8.0",
         "lhotse>=0.9.0",
+        "asteroid>=0.5.0",
     ],
     classifiers=[
         "Development Status :: 4 - Beta",
