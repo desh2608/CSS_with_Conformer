@@ -180,6 +180,3 @@ API
 Training
 Blog
 About
-
-# Ignore symlink to Kaldi utils
-utils/
